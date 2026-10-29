@@ -1720,10 +1720,16 @@ impl Drop for SlotGuard {
 /// Abort first: a writer still running holds its worktree, and a sweep before
 /// it was stopped would keep that worktree (and report it as holding work)
 /// just before the abort left it empty for good.
+///
+/// The sweep runs git per worktree, so it never runs on an async worker: a
+/// run ending normally awaits it on the blocking pool ([`Self::finish`]), and
+/// a drop hands it to that pool and returns.
 pub(crate) struct AbortOnDrop {
     bg: Arc<BackgroundSubagents>,
     #[cfg(feature = "cli")]
     events: tokio::sync::mpsc::UnboundedSender<crate::core::agent::events::StreamEvent>,
+    /// Cleared by [`Self::finish`], which has already torn down.
+    armed: bool,
 }
 
 impl AbortOnDrop {
@@ -1738,20 +1744,53 @@ impl AbortOnDrop {
             bg,
             #[cfg(feature = "cli")]
             events: events.clone(),
+            armed: true,
+        }
+    }
+
+    /// Tear down now and wait for the sweep, so its kept notice lands before
+    /// whatever the caller sends next. The run's normal end; a cancelled run
+    /// only ever reaches the drop.
+    pub(crate) async fn finish(mut self) {
+        self.armed = false;
+        self.bg.abort_all();
+        #[cfg(feature = "cli")]
+        {
+            let _ = tokio::task::spawn_blocking(self.sweep()).await;
+        }
+    }
+
+    /// End the registry's workspace session and name what it kept.
+    #[cfg(feature = "cli")]
+    fn sweep(&self) -> impl FnOnce() + Send + 'static {
+        let workspaces = self.bg.workspaces.clone();
+        let events = self.events.clone();
+        move || {
+            let kept = workspaces.finish_session();
+            if !kept.is_empty() {
+                let _ = events.send(crate::core::agent::events::StreamEvent::Notice {
+                    text: crate::core::agent::child_workspace::kept_notice(&kept),
+                });
+            }
         }
     }
 }
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         self.bg.abort_all();
         #[cfg(feature = "cli")]
         {
-            let kept = self.bg.workspaces.finish_session();
-            if !kept.is_empty() {
-                let _ = self.events.send(crate::core::agent::events::StreamEvent::Notice {
-                    text: crate::core::agent::child_workspace::kept_notice(&kept),
-                });
+            // A drop cannot wait: on a runtime the sweep goes to the blocking
+            // pool rather than stalling the worker this drop is on, and off
+            // one (a plain thread) inline is all there is.
+            let sweep = self.sweep();
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => drop(rt.spawn_blocking(sweep)),
+                Err(_) => sweep(),
             }
         }
     }
@@ -2157,7 +2196,7 @@ async fn run_subagent(
 /// once -- when the plan's last phase finishes (see [`run_phase_plan`]). Silence
 /// suppresses only the `<SYSTEM>` ping; the child still fills its blackboard
 /// file, decrements the running count, and wakes the phase driver's barrier.
-pub(crate) fn spawn_subagent(
+pub(crate) async fn spawn_subagent(
     scope: &DispatchScope,
     parent_args: &crate::core::agent::r#loop::OrchestrationArgs,
     req: SubagentRequest,
@@ -2166,13 +2205,13 @@ pub(crate) fn spawn_subagent(
     scratch: Option<&Path>,
     notify_on_finish: bool,
 ) -> Result<Dispatched, SubagentError> {
-    let prepared = prepare_dispatch(scope, parent_args, req, parent)?;
+    let prepared = prepare_dispatch(scope, parent_args, req, parent).await?;
     start_dispatch(scope, parent_args, prepared, events, scratch, notify_on_finish)
 }
 
 /// A dispatch resolved and given its workspace, not yet registered. Dropping
 /// it gives a writer's worktree back.
-pub(crate) struct PreparedDispatch {
+struct PreparedDispatch {
     name: String,
     description: String,
     resolved: ResolvedDispatch,
@@ -2184,13 +2223,12 @@ pub(crate) struct PreparedDispatch {
 
 /// The half of [`spawn_subagent`] that can fail on the request: resolve it,
 /// price it, and assign the child its workspace.
-fn prepare_dispatch(
+async fn prepare_dispatch(
     scope: &DispatchScope,
     parent_args: &crate::core::agent::r#loop::OrchestrationArgs,
     req: SubagentRequest,
     parent: &ParentRun,
 ) -> Result<PreparedDispatch, SubagentError> {
-    let bg = &scope.bg;
     if !parent_args.subagents_enabled {
         return Err(SubagentError::PermissionDenied(
             "subagents cannot dispatch nested subagents".to_string(),
@@ -2235,10 +2273,33 @@ fn prepare_dispatch(
         resolved.allowed_tools.as_deref(),
         &parent_args.permissions,
     );
-    let (workspace, lease) = bg
-        .workspaces
-        .assign(project_root, &name, writer, req.workspace.as_ref())
-        .map_err(SubagentError::Upstream)?;
+    // On the blocking pool: assigning runs `git worktree add`, `git status`
+    // and for a ref possibly a network fetch, which would otherwise stall
+    // every other task on this runtime worker until git returns.
+    let (workspace, lease) = {
+        let scope = scope.clone();
+        let root = project_root.clone();
+        let name = name.clone();
+        let request = req.workspace.clone();
+        tokio::task::spawn_blocking(move || {
+            let (ws, lease) = scope
+                .bg
+                .workspaces
+                .assign(&root, &name, writer, request.as_ref())
+                .map_err(SubagentError::Upstream)?;
+            // Checked here too, not only under the registry lock: a run
+            // cancelled while git worked drops this dispatch's future, and
+            // then nothing would take the worktree back.
+            if scope.is_stale() {
+                drop(lease);
+                scope.bg.workspaces.undo(&name, &ws);
+                return Err(SubagentError::Cancelled);
+            }
+            Ok((ws, lease))
+        })
+        .await
+        .map_err(|e| SubagentError::Upstream(format!("assigning a workspace failed: {e}")))??
+    };
     Ok(PreparedDispatch {
         name,
         description: req.description,
@@ -2564,7 +2625,7 @@ fn inject_inputs(task: &str, inputs: &[(String, String)]) -> String {
 /// each completes, handing every phase its predecessor's blackboard results.
 /// Returns as soon as phase 1 is dispatched. The whole plan is validated up front
 /// so a bad subagent fails the dispatch atomically, before any child starts.
-pub(crate) fn spawn_dispatch_plan(
+pub(crate) async fn spawn_dispatch_plan(
     bg: &Arc<BackgroundSubagents>,
     generation: u64,
     parent_args: &crate::core::agent::r#loop::OrchestrationArgs,
@@ -2646,7 +2707,8 @@ pub(crate) fn spawn_dispatch_plan(
         children: first_children,
     } = spawn_first_phase(bg, multi, first.subagents, |req| {
         spawn_subagent(&scope, parent_args, req, parent, events, scratch, !multi)
-    })?;
+    })
+    .await?;
 
     if multi {
         let remaining: Vec<Phase> = phases.collect();
@@ -2703,12 +2765,15 @@ struct FirstPhase {
 /// owes nothing the moment it reports its failure. `spawn` is a parameter so a
 /// test can make a later child fail, which no request that passed the up-front
 /// checks otherwise does on demand.
-fn spawn_first_phase(
+async fn spawn_first_phase<F>(
     bg: &BackgroundSubagents,
     multi: bool,
     reqs: Vec<SubagentRequest>,
-    mut spawn: impl FnMut(SubagentRequest) -> Result<Dispatched, SubagentError>,
-) -> Result<FirstPhase, SubagentError> {
+    mut spawn: impl FnMut(SubagentRequest) -> F,
+) -> Result<FirstPhase, SubagentError>
+where
+    F: std::future::Future<Output = Result<Dispatched, SubagentError>>,
+{
     let mut started = FirstPhase {
         names: Vec::with_capacity(reqs.len()),
         ids: Vec::with_capacity(reqs.len()),
@@ -2717,7 +2782,7 @@ fn spawn_first_phase(
     for req in reqs {
         let name = req.name.clone();
         started.names.push(name.clone());
-        match spawn(req) {
+        match spawn(req).await {
             Ok(d) => {
                 started.children.push(DispatchedChild {
                     name,
@@ -2802,7 +2867,9 @@ async fn run_phase_plan(
                 &events,
                 scratch.as_deref(),
                 false,
-            ) {
+            )
+            .await
+            {
                 Ok(d) => {
                     ids.push(d.run_id);
                     names.push(name);
@@ -4954,6 +5021,7 @@ pub(crate) mod tests {
             Some(&scratch),
             true,
         )
+        .await
         .unwrap()
         .run_id;
         let _ = await_subagent(&bg, &run_id).await;
@@ -4986,7 +5054,7 @@ pub(crate) mod tests {
         let args = max_par_args(&root);
         let bg = Arc::new(BackgroundSubagents::new(1));
         let (events_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let run_id = dispatch_reviewer(&bg, &args, &events_tx);
+        let run_id = dispatch_reviewer(&bg, &args, &events_tx).await;
         let _ = await_subagent(&bg, &run_id).await;
         assert!(!root.join("subagents").exists());
         let _ = std::fs::remove_dir_all(&root);
@@ -5017,12 +5085,13 @@ pub(crate) mod tests {
     /// One queue-test dispatch, with no scratch: these assert admission order,
     /// not spilling, and a child that fails fast has nothing to write anyway.
     #[cfg(feature = "cli")]
-    fn dispatch_reviewer(
+    async fn dispatch_reviewer(
         bg: &Arc<BackgroundSubagents>,
         args: &crate::core::agent::r#loop::OrchestrationArgs,
         events: &tokio::sync::mpsc::UnboundedSender<crate::core::agent::events::StreamEvent>,
     ) -> String {
         spawn_subagent(&bg.scope(), args, req("reviewer", None), &parent_run(), events, None, true)
+            .await
             .unwrap()
             .run_id
     }
@@ -5042,7 +5111,7 @@ pub(crate) mod tests {
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
         // Hold the only permit so the next dispatch is guaranteed to queue.
         let held = bg.semaphore.clone().try_acquire_owned().unwrap();
-        let queued_id = dispatch_reviewer(&bg, &args, &events_tx);
+        let queued_id = dispatch_reviewer(&bg, &args, &events_tx).await;
 
         let reply = message_subagent(&bg, &queued_id, "narrow it to the parser").unwrap();
         assert!(reply.contains("Queued for subagent"), "{reply}");
@@ -5113,7 +5182,8 @@ pub(crate) mod tests {
             &events_tx,
             None,
             false,
-        );
+        )
+        .await;
         assert!(matches!(refused, Err(SubagentError::Cancelled)));
         assert!(bg.workspaces.live().is_empty(), "{:?}", bg.workspaces.live());
         let branches = std::process::Command::new("git")
@@ -5123,6 +5193,68 @@ pub(crate) mod tests {
             .output()
             .unwrap();
         assert!(branches.stdout.is_empty(), "{}", String::from_utf8_lossy(&branches.stdout));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dispatch's git work (here a `{ref}` fetch from a remote that takes a
+    /// second to fail) runs off the async worker: on a single-threaded
+    /// runtime, another task keeps running while it waits.
+    #[cfg(feature = "cli")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dispatch_waiting_on_git_does_not_stall_the_runtime() {
+        use crate::core::agent::child_workspace::WorkspaceRequest;
+        let root = unique_root("no-stall");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        if !(git(&["init", "-q"])
+            && git(&["add", "a.txt"])
+            && git(&["commit", "-q", "--no-gpg-sign", "-m", "a"])
+            && git(&["config", "protocol.ext.allow", "always"])
+            && git(&["remote", "add", "origin", "ext::sh -c sleep% 1"]))
+        {
+            return;
+        }
+        write_def(&project_subagents_dir(&root), "writer", "");
+        let args = max_par_args(&root);
+        let bg = Arc::new(BackgroundSubagents::new(1));
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let request = SubagentRequest {
+            workspace: Some(WorkspaceRequest::Ref("pull/1/head".to_string())),
+            ..req("writer", None)
+        };
+        let before = ticks.load(Ordering::SeqCst);
+        let refused =
+            spawn_subagent(&bg.scope(), &args, request, &parent_run(), &events_tx, None, false)
+                .await;
+        let during = ticks.load(Ordering::SeqCst) - before;
+        ticker.abort();
+        assert!(
+            matches!(&refused, Err(SubagentError::Upstream(e)) if e.contains("fetch")),
+            "{:?}",
+            refused.err()
+        );
+        assert!(during >= 20, "the runtime stalled while git ran: {during} tick(s)");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5170,6 +5302,7 @@ pub(crate) mod tests {
         ];
         for r in earlier {
             let d = spawn_subagent(&bg.scope(), &args, r, &parent_run(), &events_tx, None, false)
+                .await
                 .unwrap();
             assert!(d.workspace.contains("worktree"), "{}", d.workspace);
             let _ = await_subagent(&bg, &d.run_id).await;
@@ -5183,7 +5316,7 @@ pub(crate) mod tests {
             agent: "writer".to_string(),
             ..req("late", None)
         };
-        let late = prepare_dispatch(&scope, &args, late, &parent_run()).unwrap();
+        let late = prepare_dispatch(&scope, &args, late, &parent_run()).await.unwrap();
         let late_wt = late.workspace.worktree.clone().expect("a writer gets a worktree");
         bg.abort_all(); // Esc: the session's registry lives on
         let refused = start_dispatch(&scope, &args, late, &events_tx, None, false);
@@ -5247,6 +5380,7 @@ pub(crate) mod tests {
             None,
             false,
         )
+        .await
         .unwrap();
         assert!(d.workspace.contains("worktree"), "{}", d.workspace);
         let reuse = WorkspaceRequest::Reuse("writer".to_string());
@@ -5273,7 +5407,7 @@ pub(crate) mod tests {
         let args = max_par_args(&root);
         let bg = Arc::new(BackgroundSubagents::new(1));
         let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-        let run_id = dispatch_reviewer(&bg, &args, &events_tx);
+        let run_id = dispatch_reviewer(&bg, &args, &events_tx).await;
 
         // Whatever the message says, delivery only ever appends a `user` turn:
         // there is no field on it for tools, permissions, sandbox, or model.
@@ -5309,8 +5443,8 @@ pub(crate) mod tests {
     /// The scope boundary in the registry rather than the schema: a child never
     /// gets a subagent registry, so it has nothing to message a sibling through.
     #[cfg(feature = "cli")]
-    #[test]
-    fn a_child_cannot_dispatch_and_so_has_no_registry_to_message_through() {
+    #[tokio::test]
+    async fn a_child_cannot_dispatch_and_so_has_no_registry_to_message_through() {
         let root = unique_root("msg-nested");
         write_def(&project_subagents_dir(&root), "reviewer", "");
         let mut child_args = max_par_args(&root);
@@ -5326,7 +5460,8 @@ pub(crate) mod tests {
                 &events_tx,
                 None,
                 true
-            ),
+            )
+            .await,
             Err(SubagentError::PermissionDenied(_))
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -5397,13 +5532,17 @@ pub(crate) mod tests {
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut starts = Vec::new();
 
-        let r1 = dispatch_reviewer(&bg, &args, &events_tx);
-        let r2 = dispatch_reviewer(&bg, &args, &events_tx);
-        let r3 = dispatch_reviewer(&bg, &args, &events_tx);
+        // The only slot is taken by a child already running. Held here rather
+        // than by a first dispatch: a dispatch yields while its workspace is
+        // assigned, and a provider-less child would finish in that window.
+        let running = bg.semaphore.clone().try_acquire_owned().unwrap();
+        let r1 = dispatch_reviewer(&bg, &args, &events_tx).await;
+        let r2 = dispatch_reviewer(&bg, &args, &events_tx).await;
+        let r3 = dispatch_reviewer(&bg, &args, &events_tx).await;
         assert_ne!(r1, r2);
         assert_ne!(r2, r3);
 
-        // The two beyond-cap dispatches must be reported queued, with their
+        // The beyond-cap dispatches must be reported queued, with their
         // 1-based queue positions in dispatch order.
         let mut queued = Vec::new();
         while let Ok(ev) = events_rx.try_recv() {
@@ -5411,20 +5550,21 @@ pub(crate) mod tests {
                 queued.push((run_id, waiting));
             }
         }
-        assert_eq!(queued.len(), 2, "two dispatches exceeded the cap of 1");
-        assert_eq!(queued[0], (r2.clone(), 1), "second dispatch queues first");
-        assert_eq!(queued[1], (r3.clone(), 2), "third dispatch queues behind it");
+        assert_eq!(queued.len(), 3, "three dispatches exceeded the cap of 1");
+        assert_eq!(queued[0], (r1.clone(), 1), "first dispatch queues first");
+        assert_eq!(queued[1], (r2.clone(), 2), "second dispatch queues behind it");
+        assert_eq!(queued[2], (r3.clone(), 3), "third dispatch queues behind that");
 
-        // The first dispatch is admitted immediately: it starts without a
-        // queued event (children fail fast without a provider, which is fine --
-        // we only assert the queueing/ordering contract here).
+        // Children fail fast without a provider, which is fine -- we only
+        // assert the queueing/ordering contract here.
+        drop(running);
         let out1 = await_subagent(&bg, &r1).await;
         let out2 = await_subagent(&bg, &r2).await;
         let out3 = await_subagent(&bg, &r3).await;
         assert!(out1.is_err(), "child run fails without a provider (expected)");
         assert!(out2.is_err() && out3.is_err(), "queued children also complete");
 
-        // Promotion must be FIFO: r2 started before r3.
+        // Promotion must be FIFO: r1, then r2, then r3.
         while let Ok(ev) = events_rx.try_recv() {
             if let StreamEvent::SubagentStart { run_id, .. } = ev {
                 starts.push(run_id);
@@ -5432,7 +5572,7 @@ pub(crate) mod tests {
         }
         let pos = |id: &str| starts.iter().position(|s| s == id);
         assert!(
-            pos(&r2).unwrap() < pos(&r3).unwrap(),
+            pos(&r1).unwrap() < pos(&r2).unwrap() && pos(&r2).unwrap() < pos(&r3).unwrap(),
             "FIFO promotion: {starts:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -5483,6 +5623,7 @@ pub(crate) mod tests {
             ],
         };
         let d = spawn_dispatch_plan(&bg, bg.generation(), &args, plan, &parent_run(), &tx, Some(&scratch))
+            .await
             .unwrap();
         assert_eq!(d.phase_count, 2);
         assert_eq!(d.total_subagents, 3);
@@ -5568,6 +5709,7 @@ pub(crate) mod tests {
             &tx,
             Some(&scratch),
         )
+        .await
         .unwrap();
         // Phase 1 started; the driver owns the remaining phase.
         assert_eq!(d.first_phase.len(), 1);
@@ -5617,7 +5759,7 @@ pub(crate) mod tests {
         bg.abort_all();
 
         let dispatched =
-            spawn_subagent(&scope, &args, worker("late"), &parent_run(), &tx, None, true);
+            spawn_subagent(&scope, &args, worker("late"), &parent_run(), &tx, None, true).await;
         assert!(
             matches!(dispatched, Err(SubagentError::Cancelled)),
             "a dispatch after teardown must be refused, not started"
@@ -5664,7 +5806,7 @@ pub(crate) mod tests {
         let bg = Arc::new(BackgroundSubagents::new(1));
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let id = dispatch_reviewer(&bg, &args, &tx);
+        let id = dispatch_reviewer(&bg, &args, &tx).await;
         // Wait for it to finish without collecting it, then collect it: the
         // entry stays either way, and both states are "done" to the barrier.
         let gate = tokio::time::timeout(
@@ -5704,8 +5846,8 @@ pub(crate) mod tests {
         // Occupy the only slot, so the first dispatch parks on the semaphore
         // (queued) rather than being admitted -- both accounting fields in play.
         let running = bg.semaphore.clone().try_acquire_owned().unwrap();
-        let _r1 = dispatch_reviewer(&bg, &args, &tx);
-        let _r2 = dispatch_reviewer(&bg, &args, &tx);
+        let _r1 = dispatch_reviewer(&bg, &args, &tx).await;
+        let _r2 = dispatch_reviewer(&bg, &args, &tx).await;
         assert_eq!(bg.running.load(Ordering::SeqCst), 2);
         assert_eq!(bg.queued.load(Ordering::SeqCst), 2);
         // Admit the first, so the abort below has to release a running child and
@@ -5749,7 +5891,7 @@ pub(crate) mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         // A free permit: admitted here and now, never queued.
-        let _r1 = dispatch_reviewer(&bg, &args, &tx);
+        let _r1 = dispatch_reviewer(&bg, &args, &tx).await;
         assert_eq!(bg.queued.load(Ordering::SeqCst), 0);
 
         bg.abort_all();
@@ -5777,7 +5919,7 @@ pub(crate) mod tests {
         // Hold the slot so the child cannot finish on its own: the waiter must
         // park, deterministically, with exactly one child outstanding.
         let _running = bg.semaphore.clone().try_acquire_owned().unwrap();
-        let _r1 = dispatch_reviewer(&bg, &args, &tx);
+        let _r1 = dispatch_reviewer(&bg, &args, &tx).await;
 
         let waiter_bg = bg.clone();
         let waiter = tokio::spawn(async move { waiter_bg.wait_for_notice().await });
@@ -5833,6 +5975,7 @@ pub(crate) mod tests {
             &tx,
             Some(&scratch),
         )
+        .await
         .unwrap();
 
         let mut all = Vec::new();
@@ -5890,6 +6033,7 @@ pub(crate) mod tests {
             ],
         };
         spawn_dispatch_plan(&bg, bg.generation(), &args, plan, &parent_run(), &tx, Some(&scratch))
+            .await
             .unwrap();
 
         let mut all = Vec::new();
@@ -5941,8 +6085,8 @@ pub(crate) mod tests {
         // Occupy the only slot BEFORE dispatching, so every dispatch queues and
         // the await below is deterministic: nothing can start while held.
         let _running = bg.semaphore.clone().try_acquire_owned().unwrap();
-        let r1 = dispatch_reviewer(&bg, &args, &events_tx);
-        let r2 = dispatch_reviewer(&bg, &args, &events_tx);
+        let r1 = dispatch_reviewer(&bg, &args, &events_tx).await;
+        let r2 = dispatch_reviewer(&bg, &args, &events_tx).await;
 
         // r2 is queued (not started), and awaiting it must NOT start it: the
         // slot is still held, so the await parks. Assert via the events: no
@@ -5983,9 +6127,9 @@ pub(crate) mod tests {
         // Hold the slot before dispatching so r1, r2, r3 all queue (parked on
         // the semaphore) -- the interesting teardown case.
         let _running = bg.semaphore.clone().try_acquire_owned().unwrap();
-        let _r1 = dispatch_reviewer(&bg, &args, &events_tx);
-        let r2 = dispatch_reviewer(&bg, &args, &events_tx);
-        let r3 = dispatch_reviewer(&bg, &args, &events_tx);
+        let _r1 = dispatch_reviewer(&bg, &args, &events_tx).await;
+        let r2 = dispatch_reviewer(&bg, &args, &events_tx).await;
+        let r3 = dispatch_reviewer(&bg, &args, &events_tx).await;
 
         AbortOnDrop::new(bg.clone(), &events_tx); // teardown with queued children parked
 
@@ -6018,7 +6162,7 @@ pub(crate) mod tests {
         let bg = Arc::new(BackgroundSubagents::new(1));
         let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
         // No provider is configured, so the child's run errors out at once.
-        let run_id = dispatch_reviewer(&bg, &args, &events_tx);
+        let run_id = dispatch_reviewer(&bg, &args, &events_tx).await;
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !bg.live_run_ids().is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -6070,6 +6214,7 @@ pub(crate) mod tests {
             None,
             false,
         )
+        .await
         .expect("the child registers");
 
         assert_eq!(bg.running.load(Ordering::SeqCst), 1, "the child is owed");
@@ -6118,25 +6263,32 @@ pub(crate) mod tests {
         // As `spawn_dispatch_plan` does for a multi-phase plan before phase 0.
         bg.begin_plan();
 
-        let mut started = Vec::new();
+        let started = std::sync::Mutex::new(Vec::new());
         let result = spawn_first_phase(
             &bg,
             true,
             vec![req("reviewer", None), req("broken", None)],
             |r| {
-                if r.name == "broken" {
-                    assert_eq!(
-                        bg.running.load(Ordering::SeqCst),
-                        1,
-                        "the good child is live when its sibling fails"
-                    );
-                    return Err(SubagentError::Upstream("cannot start".to_string()));
+                let (bg, scope, args, events_tx, started) =
+                    (&bg, &scope, &args, &events_tx, &started);
+                async move {
+                    if r.name == "broken" {
+                        assert_eq!(
+                            bg.running.load(Ordering::SeqCst),
+                            1,
+                            "the good child is live when its sibling fails"
+                        );
+                        return Err(SubagentError::Upstream("cannot start".to_string()));
+                    }
+                    let d = spawn_subagent(scope, args, r, &parent_run(), events_tx, None, false)
+                        .await?;
+                    started.lock().unwrap().push(d.run_id.clone());
+                    Ok(d)
                 }
-                let d = spawn_subagent(&scope, &args, r, &parent_run(), &events_tx, None, false)?;
-                started.push(d.run_id.clone());
-                Ok(d)
             },
-        );
+        )
+        .await;
+        let started = started.into_inner().unwrap();
 
         assert!(
             matches!(result, Err(SubagentError::Upstream(ref m)) if m == "cannot start"),

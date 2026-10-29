@@ -13106,8 +13106,13 @@ pub async fn run(
     // the real terminal, since they are what is left to merge. Children still
     // running are stopped first: a live writer holds its worktree, which would
     // otherwise be kept as busy and outlive the process even when empty.
+    // On the blocking pool, as every worktree sweep is: it runs git per
+    // worktree, and a runtime worker is no place to wait on that.
     app.subagent_set.abort_all();
-    let kept = app.subagent_set.workspaces.finish_session();
+    let workspaces = app.subagent_set.workspaces.clone();
+    let kept = tokio::task::spawn_blocking(move || workspaces.finish_session())
+        .await
+        .unwrap_or_default();
     if !kept.is_empty() {
         eprintln!("{}", crate::core::agent::child_workspace::kept_notice(&kept));
     }
