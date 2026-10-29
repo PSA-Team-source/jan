@@ -246,7 +246,13 @@ other agent fits. Dispatch independent subagents in parallel when \
 their work doesn't depend on each other; each returns in the background and a note carries its answer when \
 it finishes. Once you delegate a task it belongs to that subagent -- do not do the same work yourself; \
 spend the wait on other steps, and only `await_subagent` when nothing else is left to do. Do inline work \
-yourself for small, targeted tasks where delegating would cost more than it saves.";
+yourself for small, targeted tasks where delegating would cost more than it saves.\n\n\
+Each subagent's workspace is set when you dispatch it. One that can write or edit files works in its own \
+git worktree on its own branch, started from HEAD, so parallel writers never share a checkout and your \
+uncommitted changes are not in it; merge its branch when it is done. Any other subagent works in your \
+checkout read-only. The dispatch result says where each one works. Override with `workspace`: \"new\", \
+\"shared\", the name of an earlier subagent to continue in its worktree, or `workspace: {\"ref\": \"<git \
+ref>\"}` to review or test a branch or pull request in a checkout of its own.";
 
 /// The `# Subagents` block: the guide, then the predefined agents the
 /// `dispatch_subagent` `agent` enum accepts, each with its model and purpose.
@@ -959,6 +965,10 @@ mod tests {
         assert!(with.contains("Predefined agents (`agent` field):"), "{with}");
         assert!(with.contains("- `research` (model: smol): "), "{with}");
         assert!(with.contains("do not do the same work yourself"));
+        // Where a child works is decided at dispatch, and the guide says so.
+        assert!(with.contains("own git worktree"), "{with}");
+        assert!(with.contains("read-only"), "{with}");
+        assert!(with.contains("workspace: {\"ref\""), "{with}");
         assert!(!with.contains("keep working rather than waiting"));
         let _ = std::fs::remove_dir_all(&root);
     }
